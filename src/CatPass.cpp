@@ -1,3 +1,4 @@
+#include "llvm/ADT/BitVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
@@ -5,7 +6,9 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include <deque>
 #include <map>
+#include <set>
 
 using namespace llvm;
 
@@ -27,7 +30,7 @@ public:
       : defTable(defTable) {}
 
   void visitCallInst(CallInst &inst) {
-    auto *callee = inst.getCalledFunction();
+    auto callee = inst.getCalledFunction();
     if (CATMap.contains(callee)) {
       switch (CATMap.at(callee)) {
       case CAT_API::CAT_new:
@@ -49,6 +52,217 @@ public:
 private:
   std::map<CallInst *, std::set<CallInst *>> &defTable;
 };
+
+void createDefTable(Function &F,
+                    std::map<CallInst *, std::set<CallInst *>> &defTable) {
+  CATDefVisitor defVisitor(defTable);
+  for (auto &inst : instructions(F)) {
+    defVisitor.visit(inst);
+  }
+
+  /*for (auto &[var, defs] : defTable) {
+    for (auto &def : defs) {
+      errs() << F.getName() << *var << *def << "\n";
+    }
+  }*/
+}
+
+class CATGenKillVisitor : public InstVisitor<CATGenKillVisitor> {
+public:
+  CATGenKillVisitor(std::map<CallInst *, std::set<CallInst *>> const &defTable,
+                    std::map<Instruction *, std::set<CallInst *>> &gen,
+                    std::map<Instruction *, std::set<CallInst *>> &kill,
+                    std::map<BasicBlock *, std::set<CallInst *>> &genB,
+                    std::map<BasicBlock *, std::set<CallInst *>> &killB)
+      : defTable(defTable), gen(gen), kill(kill), genB(genB), killB(killB){};
+
+  void visitCallInst(CallInst &inst) {
+    auto parent = inst.getParent();
+    auto callee = inst.getCalledFunction();
+    if (CATMap.contains(callee)) {
+      switch (CATMap.at(callee)) {
+      case CAT_API::CAT_new:
+        gen[&inst].insert(&inst);
+        for (auto def : defTable.at(&inst)) {
+          if (&inst != def) {
+            kill[&inst].insert(def);
+          }
+        }
+        if (!killB[parent].contains(&inst)) {
+          genB[parent].insert(&inst);
+        }
+        for (auto def : defTable.at(&inst)) {
+          if (def != &inst) {
+            killB[parent].insert(def);
+          }
+        }
+        break;
+      case CAT_API::CAT_add:
+      case CAT_API::CAT_sub:
+      case CAT_API::CAT_set:
+        if (auto arg = dyn_cast<CallInst>(inst.getArgOperand(0))) {
+          gen[&inst].insert(&inst);
+          for (auto def : defTable.at(arg)) {
+            if (def != &inst) {
+              kill[&inst].insert(def);
+            }
+          }
+          if (!killB[parent].contains(&inst)) {
+            genB[parent].insert(arg);
+          }
+          for (auto def : defTable.at(arg)) {
+            if (def != &inst) {
+              killB[parent].insert(def);
+            }
+          }
+        }
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
+private:
+  std::map<CallInst *, std::set<CallInst *>> const &defTable;
+  std::map<Instruction *, std::set<CallInst *>> &gen, &kill;
+  std::map<BasicBlock *, std::set<CallInst *>> &genB, &killB;
+};
+
+struct WorkList {
+public:
+  void append(BasicBlock *b) {
+    if (!blocks.contains(b)) {
+      blocks.insert(b);
+      todo.push_back(b);
+    }
+  }
+
+  BasicBlock *pop() {
+    auto b = todo.front();
+    todo.pop_front();
+    blocks.erase(b);
+    return b;
+  }
+
+  bool empty() { return todo.empty(); }
+
+private:
+  std::set<BasicBlock *> blocks;
+  std::deque<BasicBlock *> todo;
+};
+
+void runReachingDef(Function &F,
+                    std::map<CallInst *, std::set<CallInst *>> const &defTable,
+                    std::map<Instruction *, std::set<CallInst *>> &in,
+                    std::map<Instruction *, std::set<CallInst *>> &out) {
+  std::map<Instruction *, std::set<CallInst *>> gen, kill;
+  std::map<BasicBlock *, std::set<CallInst *>> genB, killB;
+  CATGenKillVisitor genKillVisitor(defTable, gen, kill, genB, killB);
+  for (auto &b : F) {
+    for (auto it = b.rbegin(); it != b.rend(); it++) {
+      genKillVisitor.visit(*it);
+    }
+  }
+
+  std::map<CallInst *, int> vToI;
+  std::vector<CallInst *> iToV(defTable.size());
+  int i = 0;
+  for (auto &v : defTable) {
+    vToI[v.first] = i;
+    iToV[i] = v.first;
+    i++;
+  }
+
+  std::map<BasicBlock *, BitVector> genBV, killBV;
+  std::map<BasicBlock *, BitVector> inBV, outBV;
+  WorkList workList;
+  for (auto &b : F) {
+    genBV[&b] = BitVector(defTable.size());
+    for (auto &inst : genB[&b]) {
+      genBV[&b].set(vToI[inst]);
+    }
+    killBV[&b] = BitVector(defTable.size());
+    for (auto &inst : killB[&b]) {
+      killBV[&b].set(vToI[inst]);
+    }
+    inBV[&b] = BitVector(defTable.size());
+    outBV[&b] = BitVector(defTable.size());
+    workList.append(&b);
+  }
+
+  while (!workList.empty()) {
+    auto b = workList.pop();
+    auto oldOut = outBV[b];
+    for (auto p : predecessors(b)) {
+      inBV[b] |= outBV[p];
+    }
+
+    outBV[b] = inBV[b];
+    outBV[b].reset(killBV[b]);
+    outBV[b] |= genBV[b];
+
+    if (oldOut != outBV[b]) {
+      for (auto s : successors(b)) {
+        workList.append(s);
+      }
+    }
+  }
+
+  std::map<BasicBlock *, std::set<CallInst *>> inB, outB;
+  for (auto &b : F) {
+    for (auto i : inBV[&b].set_bits()) {
+      inB[&b].insert(iToV[i]);
+    }
+    for (auto i : outBV[&b].set_bits()) {
+      outB[&b].insert(iToV[i]);
+    }
+  }
+
+  for (auto &b : F) {
+    for (auto &inst : b) {
+      in[&inst] = {};
+      out[&inst] = {};
+    }
+
+    auto front = &b.front();
+    in[front] = inB[&b];
+    out[front] = gen[front];
+    for (auto i : in[front]) {
+      if (!kill[front].contains(i)) {
+        out[front].insert(i);
+      }
+    }
+    auto inst = front;
+    while (inst != &b.back()) {
+      auto next = inst->getNextNode();
+      in[next] = out[inst];
+      out[next] = gen[next];
+      for (auto i : in[next]) {
+        if (!kill[next].contains(i)) {
+          out[next].insert(i);
+        }
+      }
+      inst = next;
+    }
+  }
+
+  errs() << "Function \"" << F.getName() << "\""
+         << "\n";
+  for (auto &b : F) {
+    for (auto &inst : b) {
+      errs() << "INSTRUCTION:" << inst << "\nIN\n{\n";
+      for (auto i : in.at(&inst)) {
+        errs() << *i << "\n";
+      }
+      errs() << "}\nOUT\n{\n";
+      for (auto i : out.at(&inst)) {
+        errs() << *i << "\n";
+      }
+      errs() << "}\n";
+    }
+  }
+}
 
 struct CAT : public FunctionPass {
   static char ID;
@@ -72,17 +286,12 @@ struct CAT : public FunctionPass {
   // transformed
   bool runOnFunction(Function &F) override {
     std::map<CallInst *, std::set<CallInst *>> defTable;
+    std::map<Instruction *, std::set<CallInst *>> in, out;
 
-    CATDefVisitor visitor(defTable);
-    for (auto &inst : instructions(F)) {
-      visitor.visit(inst);
-    }
+    createDefTable(F, defTable);
 
-    for (auto [var, defs] : defTable) {
-      for (auto def : defs) {
-        errs() << F.getName() << *var << *def << "\n";
-      }
-    }
+    runReachingDef(F, defTable, in, out);
+
     return false;
   }
 
