@@ -24,41 +24,48 @@ enum CAT_API {
 
 std::map<Function *, CAT_API> CATMap;
 
-class CATDefVisitor : public InstVisitor<CATDefVisitor> {
+class CATVisitor : public InstVisitor<CATVisitor> {
 public:
-  CATDefVisitor(std::map<Instruction *, std::set<Instruction *>> &defTable)
-      : defTable(defTable) {}
+  CATVisitor(std::vector<CallInst *> &CATInsts) : CATInsts(CATInsts) {}
 
   void visitCallInst(CallInst &inst) {
     auto callee = inst.getCalledFunction();
     if (CATMap.contains(callee)) {
-      switch (CATMap.at(callee)) {
-      case CAT_API::CAT_new:
-        defTable[&inst].insert(&inst);
-        break;
-      case CAT_API::CAT_add:
-      case CAT_API::CAT_sub:
-      case CAT_API::CAT_set:
-        if (auto arg = dyn_cast<Instruction>(inst.getArgOperand(0))) {
-          defTable[arg].insert(&inst);
-          defTable[arg].insert(arg);
-        }
-        break;
-      default:
-        break;
-      }
+      CATInsts.push_back(&inst);
     }
   }
 
 private:
-  std::map<Instruction *, std::set<Instruction *>> &defTable;
+  std::vector<CallInst *> &CATInsts;
 };
 
-void createDefTable(
-    Function &F, std::map<Instruction *, std::set<Instruction *>> &defTable) {
-  CATDefVisitor defVisitor(defTable);
+void getCATInsts(Function &F, std::vector<CallInst *> &CATInsts) {
+  CATVisitor visitor(CATInsts);
   for (auto &inst : instructions(F)) {
-    defVisitor.visit(inst);
+    visitor.visit(&inst);
+  }
+}
+
+void createDefTable(
+    Function &F, std::vector<CallInst *> const &CATInsts,
+    std::map<Instruction *, std::set<Instruction *>> &defTable) {
+  for (auto inst : CATInsts) {
+    auto callee = inst->getCalledFunction();
+    switch (CATMap.at(callee)) {
+    case CAT_API::CAT_new:
+      defTable[inst].insert(inst);
+      break;
+    case CAT_API::CAT_add:
+    case CAT_API::CAT_sub:
+    case CAT_API::CAT_set:
+      if (auto arg = dyn_cast<Instruction>(inst->getArgOperand(0))) {
+        defTable[arg].insert(inst);
+        defTable[arg].insert(arg);
+      }
+      break;
+    default:
+      break;
+    }
   }
 
   /*
@@ -69,61 +76,6 @@ void createDefTable(
   }
   */
 }
-
-class CATGenKillVisitor : public InstVisitor<CATGenKillVisitor> {
-public:
-  CATGenKillVisitor(
-      std::map<Instruction *, std::set<Instruction *>> const &defTable,
-      std::map<Instruction *, std::set<Instruction *>> &gen,
-      std::map<Instruction *, std::set<Instruction *>> &kill,
-      std::map<BasicBlock *, std::set<Instruction *>> &genB,
-      std::map<BasicBlock *, std::set<Instruction *>> &killB)
-      : defTable(defTable), gen(gen), kill(kill), genB(genB), killB(killB){};
-
-  void visitCallInst(CallInst &inst) {
-    auto parent = inst.getParent();
-    auto callee = inst.getCalledFunction();
-    if (CATMap.contains(callee)) {
-      switch (CATMap.at(callee)) {
-      case CAT_API::CAT_new:
-        gen[&inst].insert(&inst);
-        if (!killB[parent].contains(&inst)) {
-          genB[parent].insert(&inst);
-        }
-        for (auto def : defTable.at(&inst)) {
-          if (def != &inst) {
-            kill[&inst].insert(def);
-            killB[parent].insert(def);
-          }
-        }
-        break;
-      case CAT_API::CAT_add:
-      case CAT_API::CAT_sub:
-      case CAT_API::CAT_set:
-        if (auto arg = dyn_cast<Instruction>(inst.getArgOperand(0))) {
-          gen[&inst].insert(&inst);
-          if (!killB[parent].contains(&inst)) {
-            genB[parent].insert(&inst);
-          }
-          for (auto def : defTable.at(arg)) {
-            if (def != &inst) {
-              kill[&inst].insert(def);
-              killB[parent].insert(def);
-            }
-          }
-        }
-        break;
-      default:
-        break;
-      }
-    }
-  }
-
-private:
-  std::map<Instruction *, std::set<Instruction *>> const &defTable;
-  std::map<Instruction *, std::set<Instruction *>> &gen, &kill;
-  std::map<BasicBlock *, std::set<Instruction *>> &genB, &killB;
-};
 
 struct WorkList {
 public:
@@ -149,30 +101,56 @@ private:
 };
 
 void createReachingDefs(
-    Function &F,
+    Function &F, std::vector<CallInst *> const &CATInsts,
     std::map<Instruction *, std::set<Instruction *>> const &defTable,
     std::map<Instruction *, std::set<Instruction *>> &in,
     std::map<Instruction *, std::set<Instruction *>> &out) {
-  std::map<Instruction *, std::set<Instruction *>> gen, kill;
-  std::map<BasicBlock *, std::set<Instruction *>> genB, killB;
-  CATGenKillVisitor genKillVisitor(defTable, gen, kill, genB, killB);
-  for (auto &b : F) {
-    for (auto it = b.rbegin(); it != b.rend(); it++) {
-      genKillVisitor.visit(*it);
-    }
-  }
-
+  int i = 0;
   std::map<Instruction *, int> CATToInt;
   std::vector<Instruction *> intToCAT;
-  int i = 0;
-  for (auto &inst : instructions(F)) {
-    if (auto callInst = dyn_cast<CallInst>(&inst)) {
-      auto callee = callInst->getCalledFunction();
-      if (CATMap.contains(callee)) {
-        CATToInt[callInst] = i;
-        intToCAT.push_back(callInst);
-        i++;
+  std::map<Instruction *, std::set<Instruction *>> gen, kill;
+  std::map<BasicBlock *, std::set<Instruction *>> genB, killB;
+
+  for (auto it = CATInsts.rbegin(); it != CATInsts.rend(); it++) {
+    auto inst = *it;
+
+    CATToInt[inst] = i;
+    intToCAT.push_back(inst);
+    i++;
+
+    auto parent = inst->getParent();
+    auto callee = inst->getCalledFunction();
+    switch (CATMap.at(callee)) {
+    case CAT_API::CAT_new:
+      gen[inst].insert(inst);
+      if (!killB[parent].contains(inst)) {
+        genB[parent].insert(inst);
       }
+      for (auto def : defTable.at(inst)) {
+        if (def != inst) {
+          kill[inst].insert(def);
+          killB[parent].insert(def);
+        }
+      }
+      break;
+    case CAT_API::CAT_add:
+    case CAT_API::CAT_sub:
+    case CAT_API::CAT_set:
+      if (auto arg = dyn_cast<Instruction>(inst->getArgOperand(0))) {
+        gen[inst].insert(inst);
+        if (!killB[parent].contains(inst)) {
+          genB[parent].insert(inst);
+        }
+        for (auto def : defTable.at(arg)) {
+          if (def != inst) {
+            kill[inst].insert(def);
+            killB[parent].insert(def);
+          }
+        }
+      }
+      break;
+    default:
+      break;
     }
   }
 
@@ -288,12 +266,14 @@ struct CAT : public FunctionPass {
   // The LLVM IR of the input functions is ready and it can be analyzed and/or
   // transformed
   bool runOnFunction(Function &F) override {
+    std::vector<CallInst *> CATInsts;
+    getCATInsts(F, CATInsts);
+
     std::map<Instruction *, std::set<Instruction *>> defTable;
+    createDefTable(F, CATInsts, defTable);
+
     std::map<Instruction *, std::set<Instruction *>> in, out;
-
-    createDefTable(F, defTable);
-
-    createReachingDefs(F, defTable, in, out);
+    createReachingDefs(F, CATInsts, defTable, in, out);
 
     return false;
   }
