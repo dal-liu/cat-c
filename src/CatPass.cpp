@@ -7,8 +7,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include <deque>
-#include <map>
-#include <set>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -22,11 +22,17 @@ enum CAT_API {
   CAT_destroy,
 };
 
-std::map<Function *, CAT_API> CATMap;
+std::unordered_map<Function *, CAT_API> CATMap;
+
+using CATList = std::vector<CallInst *>;
+using DefTable =
+    std::unordered_map<Instruction *, std::unordered_set<Instruction *>>;
+using DFASet =
+    std::unordered_map<Instruction *, std::unordered_set<Instruction *>>;
 
 class CATVisitor : public InstVisitor<CATVisitor> {
 public:
-  CATVisitor(std::vector<CallInst *> &CATInsts) : CATInsts(CATInsts) {}
+  CATVisitor(CATList &CATInsts) : CATInsts(CATInsts) {}
 
   void visitCallInst(CallInst &inst) {
     auto callee = inst.getCalledFunction();
@@ -36,19 +42,17 @@ public:
   }
 
 private:
-  std::vector<CallInst *> &CATInsts;
+  CATList &CATInsts;
 };
 
-void getCATInsts(Function &F, std::vector<CallInst *> &CATInsts) {
-  CATVisitor visitor(CATInsts);
+void getCATInsts(Function &F, CATList &CATInsts) {
+  CATVisitor visitor{CATInsts};
   for (auto &inst : instructions(F)) {
     visitor.visit(&inst);
   }
 }
 
-void createDefTable(
-    Function &F, std::vector<CallInst *> const &CATInsts,
-    std::map<Instruction *, std::set<Instruction *>> &defTable) {
+void createDefTable(Function &F, CATList const &CATInsts, DefTable &defTable) {
   for (auto inst : CATInsts) {
     auto callee = inst->getCalledFunction();
     switch (CATMap.at(callee)) {
@@ -68,13 +72,11 @@ void createDefTable(
     }
   }
 
-  /*
-  for (auto &[var, defs] : defTable) {
+  /* for (auto &[var, defs] : defTable) {
     for (auto &def : defs) {
       errs() << F.getName() << *var << *def << "\n";
     }
-  }
-  */
+  } */
 }
 
 struct WorkList {
@@ -96,27 +98,25 @@ public:
   bool empty() { return todo.empty(); }
 
 private:
-  std::set<BasicBlock *> blocks;
+  std::unordered_set<BasicBlock *> blocks;
   std::deque<BasicBlock *> todo;
 };
 
-void createReachingDefs(
-    Function &F, std::vector<CallInst *> const &CATInsts,
-    std::map<Instruction *, std::set<Instruction *>> const &defTable,
-    std::map<Instruction *, std::set<Instruction *>> &in,
-    std::map<Instruction *, std::set<Instruction *>> &out) {
-  int i = 0;
-  std::map<Instruction *, int> CATToInt;
-  std::vector<Instruction *> intToCAT;
-  std::map<Instruction *, std::set<Instruction *>> gen, kill;
-  std::map<BasicBlock *, std::set<Instruction *>> genB, killB;
+void createReachingDefs(Function &F, CATList const &CATInsts,
+                        DefTable const &defTable, DFASet &in, DFASet &out) {
+  unsigned int n = CATInsts.size();
+  std::vector<Instruction *> intToCAT{n};
+  std::unordered_map<Instruction *, int> CATToInt;
+  std::unordered_map<Instruction *, std::unordered_set<Instruction *>> gen,
+      kill;
+  std::unordered_map<BasicBlock *, std::unordered_set<Instruction *>> genB,
+      killB;
 
-  for (auto it = CATInsts.rbegin(); it != CATInsts.rend(); it++) {
+  for (auto [it, i] = std::tuple{CATInsts.rbegin(), 0}; it != CATInsts.rend();
+       it++, i++) {
     auto inst = *it;
-
+    intToCAT[i] = inst;
     CATToInt[inst] = i;
-    intToCAT.push_back(inst);
-    i++;
 
     auto parent = inst->getParent();
     auto callee = inst->getCalledFunction();
@@ -154,20 +154,20 @@ void createReachingDefs(
     }
   }
 
-  std::map<BasicBlock *, BitVector> genBV, killBV;
-  std::map<BasicBlock *, BitVector> inBV, outBV;
+  std::unordered_map<BasicBlock *, BitVector> genBV, killBV, inBV, outBV;
   WorkList workList;
+
   for (auto &b : F) {
-    genBV[&b] = BitVector(i);
-    killBV[&b] = BitVector(i);
-    inBV[&b] = BitVector(i);
-    outBV[&b] = BitVector(i);
-    for (auto &inst : genB[&b]) {
+    genBV[&b] = BitVector{n};
+    for (auto inst : genB[&b]) {
       genBV[&b].set(CATToInt[inst]);
     }
-    for (auto &inst : killB[&b]) {
+    killBV[&b] = BitVector{n};
+    for (auto inst : killB[&b]) {
       killBV[&b].set(CATToInt[inst]);
     }
+    inBV[&b] = BitVector{n};
+    outBV[&b] = BitVector{n};
     workList.append(&b);
   }
 
@@ -189,7 +189,8 @@ void createReachingDefs(
     }
   }
 
-  std::map<BasicBlock *, std::set<Instruction *>> inB, outB;
+  std::unordered_map<BasicBlock *, std::unordered_set<Instruction *>> inB, outB;
+
   for (auto &b : F) {
     for (auto i : inBV[&b].set_bits()) {
       inB[&b].insert(intToCAT[i]);
@@ -200,35 +201,30 @@ void createReachingDefs(
   }
 
   for (auto &b : F) {
-    for (auto &inst : b) {
-      in[&inst] = {};
-      out[&inst] = {};
-    }
-
     auto front = &b.front();
     in[front] = inB[&b];
     out[front] = gen[front];
-    for (auto i : in[front]) {
-      if (!kill[front].contains(i)) {
-        out[front].insert(i);
+    for (auto inst : in[front]) {
+      if (!kill[front].contains(inst)) {
+        out[front].insert(inst);
       }
     }
 
-    auto inst = front;
-    while (inst != &b.back()) {
-      auto next = inst->getNextNode();
-      in[next] = out[inst];
-      out[next] = gen[next];
-      for (auto i : in[next]) {
-        if (!kill[next].contains(i)) {
-          out[next].insert(i);
+    auto t = front;
+    while (t != &b.back()) {
+      auto tNext = t->getNextNode();
+      in[tNext] = out[t];
+      out[tNext] = gen[tNext];
+      for (auto inst : in[tNext]) {
+        if (!kill[tNext].contains(inst)) {
+          out[tNext].insert(inst);
         }
       }
-      inst = next;
+      t = tNext;
     }
   }
 
-  errs() << "Function \"" << F.getName() << "\""
+  /* errs() << "Function \"" << F.getName() << "\""
          << "\n";
   for (auto &b : F) {
     for (auto &inst : b) {
@@ -242,7 +238,7 @@ void createReachingDefs(
       }
       errs() << "}\n";
     }
-  }
+  } */
 }
 
 struct CAT : public FunctionPass {
@@ -266,13 +262,13 @@ struct CAT : public FunctionPass {
   // The LLVM IR of the input functions is ready and it can be analyzed and/or
   // transformed
   bool runOnFunction(Function &F) override {
-    std::vector<CallInst *> CATInsts;
+    CATList CATInsts;
     getCATInsts(F, CATInsts);
 
-    std::map<Instruction *, std::set<Instruction *>> defTable;
+    DefTable defTable;
     createDefTable(F, CATInsts, defTable);
 
-    std::map<Instruction *, std::set<Instruction *>> in, out;
+    DFASet in, out;
     createReachingDefs(F, CATInsts, defTable, in, out);
 
     return false;
