@@ -1,6 +1,5 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Pass.h"
@@ -13,6 +12,9 @@
 using namespace llvm;
 
 namespace {
+bool printDefTable = false;
+bool printReachingDefs = false;
+
 enum CAT_API {
   CAT_new,
   CAT_add,
@@ -24,7 +26,7 @@ enum CAT_API {
 
 std::unordered_map<Function *, CAT_API> CATMap;
 
-using CATList = std::vector<CallInst *>;
+using CATInsts = std::unordered_map<BasicBlock *, std::vector<CallInst *>>;
 using DefTable =
     std::unordered_map<Instruction *, std::unordered_set<Instruction *>>;
 using DFASet =
@@ -32,51 +34,59 @@ using DFASet =
 
 class CATVisitor : public InstVisitor<CATVisitor> {
 public:
-  CATVisitor(CATList &CATInsts) : CATInsts(CATInsts) {}
+  CATVisitor(CATInsts &CATInsts) : CATInsts(CATInsts) {}
 
   void visitCallInst(CallInst &inst) {
+    auto parent = inst.getParent();
     auto callee = inst.getCalledFunction();
     if (CATMap.contains(callee)) {
-      CATInsts.push_back(&inst);
+      CATInsts[parent].push_back(&inst);
     }
   }
 
 private:
-  CATList &CATInsts;
+  CATInsts &CATInsts;
 };
 
-void getCATInsts(Function &F, CATList &CATInsts) {
-  CATVisitor visitor{CATInsts};
-  for (auto &inst : instructions(F)) {
-    visitor.visit(&inst);
+void getCATInsts(Function &F, CATInsts &CATInsts) {
+  CATVisitor visitor(CATInsts);
+  for (auto &b : F) {
+    CATInsts[&b] = {};
+    for (auto &inst : b) {
+      visitor.visit(&inst);
+    }
   }
 }
 
-void createDefTable(Function &F, CATList const &CATInsts, DefTable &defTable) {
-  for (auto inst : CATInsts) {
-    auto callee = inst->getCalledFunction();
-    switch (CATMap.at(callee)) {
-    case CAT_API::CAT_new:
-      defTable[inst].insert(inst);
-      break;
-    case CAT_API::CAT_add:
-    case CAT_API::CAT_sub:
-    case CAT_API::CAT_set:
-      if (auto arg = dyn_cast<Instruction>(inst->getArgOperand(0))) {
-        defTable[arg].insert(inst);
-        defTable[arg].insert(arg);
+void createDefTable(Function &F, CATInsts const &CATInsts, DefTable &defTable) {
+  for (auto &b : F) {
+    for (auto inst : CATInsts.at(&b)) {
+      auto callee = inst->getCalledFunction();
+      switch (CATMap.at(callee)) {
+      case CAT_API::CAT_new:
+        defTable[inst].insert(inst);
+        break;
+      case CAT_API::CAT_add:
+      case CAT_API::CAT_sub:
+      case CAT_API::CAT_set:
+        if (auto arg = dyn_cast<Instruction>(inst->getArgOperand(0))) {
+          defTable[arg].insert(inst);
+          defTable[arg].insert(arg);
+        }
+        break;
+      default:
+        break;
       }
-      break;
-    default:
-      break;
     }
   }
 
-  /* for (auto &[var, defs] : defTable) {
-    for (auto &def : defs) {
-      errs() << F.getName() << *var << *def << "\n";
+  if (printDefTable) {
+    for (auto &[var, defs] : defTable) {
+      for (auto &def : defs) {
+        errs() << F.getName() << *var << *def << "\n";
+      }
     }
-  } */
+  }
 }
 
 struct WorkList {
@@ -102,55 +112,62 @@ private:
   std::deque<BasicBlock *> todo;
 };
 
-void createReachingDefs(Function &F, CATList const &CATInsts,
+void createReachingDefs(Function &F, CATInsts const &CATInsts,
                         DefTable const &defTable, DFASet &in, DFASet &out) {
-  unsigned int n = CATInsts.size();
-  std::vector<Instruction *> intToCAT{n};
+  int size = 0;
+  for (auto &pair : CATInsts) {
+    size += pair.second.size();
+  }
+
+  std::vector<Instruction *> intToCAT(size);
   std::unordered_map<Instruction *, int> CATToInt;
   std::unordered_map<Instruction *, std::unordered_set<Instruction *>> gen,
       kill;
   std::unordered_map<BasicBlock *, std::unordered_set<Instruction *>> genB,
-      killB;
+      killB, inB, outB;
 
-  for (auto [it, i] = std::tuple{CATInsts.rbegin(), 0}; it != CATInsts.rend();
-       it++, i++) {
-    auto inst = *it;
-    intToCAT[i] = inst;
-    CATToInt[inst] = i;
+  int i = 0;
+  for (auto &b : F) {
+    auto vec = CATInsts.at(&b);
+    for (auto it = vec.rbegin(); it != vec.rend(); it++) {
+      auto inst = *it;
+      intToCAT[i] = inst;
+      CATToInt[inst] = i;
+      i++;
 
-    auto parent = inst->getParent();
-    auto callee = inst->getCalledFunction();
-    switch (CATMap.at(callee)) {
-    case CAT_API::CAT_new:
-      gen[inst].insert(inst);
-      if (!killB[parent].contains(inst)) {
-        genB[parent].insert(inst);
-      }
-      for (auto def : defTable.at(inst)) {
-        if (def != inst) {
-          kill[inst].insert(def);
-          killB[parent].insert(def);
-        }
-      }
-      break;
-    case CAT_API::CAT_add:
-    case CAT_API::CAT_sub:
-    case CAT_API::CAT_set:
-      if (auto arg = dyn_cast<Instruction>(inst->getArgOperand(0))) {
+      auto callee = inst->getCalledFunction();
+      switch (CATMap.at(callee)) {
+      case CAT_API::CAT_new:
         gen[inst].insert(inst);
-        if (!killB[parent].contains(inst)) {
-          genB[parent].insert(inst);
+        if (!killB[&b].contains(inst)) {
+          genB[&b].insert(inst);
         }
-        for (auto def : defTable.at(arg)) {
+        for (auto def : defTable.at(inst)) {
           if (def != inst) {
             kill[inst].insert(def);
-            killB[parent].insert(def);
+            killB[&b].insert(def);
           }
         }
+        break;
+      case CAT_API::CAT_add:
+      case CAT_API::CAT_sub:
+      case CAT_API::CAT_set:
+        if (auto arg = dyn_cast<Instruction>(inst->getArgOperand(0))) {
+          gen[inst].insert(inst);
+          if (!killB[&b].contains(inst)) {
+            genB[&b].insert(inst);
+          }
+          for (auto def : defTable.at(arg)) {
+            if (def != inst) {
+              kill[inst].insert(def);
+              killB[&b].insert(def);
+            }
+          }
+        }
+        break;
+      default:
+        break;
       }
-      break;
-    default:
-      break;
     }
   }
 
@@ -158,16 +175,16 @@ void createReachingDefs(Function &F, CATList const &CATInsts,
   WorkList workList;
 
   for (auto &b : F) {
-    genBV[&b] = BitVector{n};
+    genBV[&b] = BitVector(size);
     for (auto inst : genB[&b]) {
       genBV[&b].set(CATToInt[inst]);
     }
-    killBV[&b] = BitVector{n};
+    killBV[&b] = BitVector(size);
     for (auto inst : killB[&b]) {
       killBV[&b].set(CATToInt[inst]);
     }
-    inBV[&b] = BitVector{n};
-    outBV[&b] = BitVector{n};
+    inBV[&b] = BitVector(size);
+    outBV[&b] = BitVector(size);
     workList.append(&b);
   }
 
@@ -189,8 +206,6 @@ void createReachingDefs(Function &F, CATList const &CATInsts,
     }
   }
 
-  std::unordered_map<BasicBlock *, std::unordered_set<Instruction *>> inB, outB;
-
   for (auto &b : F) {
     for (auto i : inBV[&b].set_bits()) {
       inB[&b].insert(intToCAT[i]);
@@ -201,7 +216,12 @@ void createReachingDefs(Function &F, CATList const &CATInsts,
   }
 
   for (auto &b : F) {
-    auto front = &b.front();
+    auto vec = CATInsts.at(&b);
+    if (vec.empty()) {
+      continue;
+    }
+
+    auto front = vec[0];
     in[front] = inB[&b];
     out[front] = gen[front];
     for (auto inst : in[front]) {
@@ -210,9 +230,8 @@ void createReachingDefs(Function &F, CATList const &CATInsts,
       }
     }
 
-    auto t = front;
-    while (t != &b.back()) {
-      auto tNext = t->getNextNode();
+    for (unsigned long i = 1; i < vec.size() - 1; i++) {
+      auto t = vec[i], tNext = vec[i + 1];
       in[tNext] = out[t];
       out[tNext] = gen[tNext];
       for (auto inst : in[tNext]) {
@@ -220,25 +239,50 @@ void createReachingDefs(Function &F, CATList const &CATInsts,
           out[tNext].insert(inst);
         }
       }
-      t = tNext;
     }
   }
 
-  /* errs() << "Function \"" << F.getName() << "\""
-         << "\n";
-  for (auto &b : F) {
-    for (auto &inst : b) {
-      errs() << "INSTRUCTION:" << inst << "\nIN\n{\n";
-      for (auto i : in.at(&inst)) {
-        errs() << *i << "\n";
+  if (printReachingDefs) {
+    for (auto &b : F) {
+      auto front = &b.front();
+      in[front] = inB[&b];
+      out[front] = gen[front];
+      for (auto inst : in[front]) {
+        if (!kill[front].contains(inst)) {
+          out[front].insert(inst);
+        }
       }
-      errs() << "}\nOUT\n{\n";
-      for (auto i : out.at(&inst)) {
-        errs() << *i << "\n";
+
+      auto t = front;
+      while (t != &b.back()) {
+        auto tNext = t->getNextNode();
+        in[tNext] = out[t];
+        out[tNext] = gen[tNext];
+        for (auto inst : in[tNext]) {
+          if (!kill[tNext].contains(inst)) {
+            out[tNext].insert(inst);
+          }
+        }
+        t = tNext;
       }
-      errs() << "}\n";
     }
-  } */
+
+    errs() << "Function \"" << F.getName() << "\""
+           << "\n";
+    for (auto &b : F) {
+      for (auto &inst : b) {
+        errs() << "INSTRUCTION:" << inst << "\nIN\n{\n";
+        for (auto i : in[&inst]) {
+          errs() << *i << "\n";
+        }
+        errs() << "}\nOUT\n{\n";
+        for (auto i : out[&inst]) {
+          errs() << *i << "\n";
+        }
+        errs() << "}\n";
+      }
+    }
+  }
 }
 
 struct CAT : public FunctionPass {
@@ -262,7 +306,7 @@ struct CAT : public FunctionPass {
   // The LLVM IR of the input functions is ready and it can be analyzed and/or
   // transformed
   bool runOnFunction(Function &F) override {
-    CATList CATInsts;
+    CATInsts CATInsts;
     getCATInsts(F, CATInsts);
 
     DefTable defTable;
