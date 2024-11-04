@@ -9,12 +9,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// #define PRINT_DEF_TABLE
+// #define PRINT_REACHING_DEFS
+
 using namespace llvm;
 
 namespace {
-bool printDefTable = false;
-bool printReachingDefs = false;
-
 enum CAT_API {
   CAT_new,
   CAT_add,
@@ -80,13 +80,13 @@ void createDefTable(Function &F, CATInsts const &CATInsts, DefTable &defTable) {
     }
   }
 
-  if (printDefTable) {
-    for (auto &[var, defs] : defTable) {
-      for (auto &def : defs) {
-        errs() << F.getName() << *var << *def << "\n";
-      }
+#ifdef PRINT_DEF_TABLE
+  for (auto &[var, defs] : defTable) {
+    for (auto &def : defs) {
+      errs() << F.getName() << *var << *def << "\n";
     }
   }
+#endif
 }
 
 struct WorkList {
@@ -215,6 +215,7 @@ void createReachingDefs(Function &F, CATInsts const &CATInsts,
     }
   }
 
+#ifndef PRINT_REACHING_DEFS
   for (auto &b : F) {
     auto vec = CATInsts.at(&b);
     if (vec.empty()) {
@@ -241,48 +242,47 @@ void createReachingDefs(Function &F, CATInsts const &CATInsts,
       }
     }
   }
-
-  if (printReachingDefs) {
-    for (auto &b : F) {
-      auto front = &b.front();
-      in[front] = inB[&b];
-      out[front] = gen[front];
-      for (auto inst : in[front]) {
-        if (!kill[front].contains(inst)) {
-          out[front].insert(inst);
-        }
-      }
-
-      auto t = front;
-      while (t != &b.back()) {
-        auto tNext = t->getNextNode();
-        in[tNext] = out[t];
-        out[tNext] = gen[tNext];
-        for (auto inst : in[tNext]) {
-          if (!kill[tNext].contains(inst)) {
-            out[tNext].insert(inst);
-          }
-        }
-        t = tNext;
+#else
+  for (auto &b : F) {
+    auto front = &b.front();
+    in[front] = inB[&b];
+    out[front] = gen[front];
+    for (auto inst : in[front]) {
+      if (!kill[front].contains(inst)) {
+        out[front].insert(inst);
       }
     }
 
-    errs() << "Function \"" << F.getName() << "\""
-           << "\n";
-    for (auto &b : F) {
-      for (auto &inst : b) {
-        errs() << "INSTRUCTION:" << inst << "\nIN\n{\n";
-        for (auto i : in[&inst]) {
-          errs() << *i << "\n";
+    auto t = front;
+    while (t != &b.back()) {
+      auto tNext = t->getNextNode();
+      in[tNext] = out[t];
+      out[tNext] = gen[tNext];
+      for (auto inst : in[tNext]) {
+        if (!kill[tNext].contains(inst)) {
+          out[tNext].insert(inst);
         }
-        errs() << "}\nOUT\n{\n";
-        for (auto i : out[&inst]) {
-          errs() << *i << "\n";
-        }
-        errs() << "}\n";
       }
+      t = tNext;
     }
   }
+
+  errs() << "Function \"" << F.getName() << "\""
+         << "\n";
+  for (auto &b : F) {
+    for (auto &inst : b) {
+      errs() << "INSTRUCTION:" << inst << "\nIN\n{\n";
+      for (auto i : in[&inst]) {
+        errs() << *i << "\n";
+      }
+      errs() << "}\nOUT\n{\n";
+      for (auto i : out[&inst]) {
+        errs() << *i << "\n";
+      }
+      errs() << "}\n";
+    }
+  }
+#endif
 }
 
 struct CAT : public FunctionPass {
