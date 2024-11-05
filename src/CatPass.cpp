@@ -1,10 +1,15 @@
 #include "llvm/ADT/BitVector.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include <algorithm>
 #include <deque>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,13 +29,13 @@ enum CAT_API {
   CAT_destroy,
 };
 
-std::unordered_map<Function *, CAT_API> CATMap;
-
 using CATInsts = std::unordered_map<BasicBlock *, std::vector<CallInst *>>;
 using DefTable =
     std::unordered_map<Instruction *, std::unordered_set<Instruction *>>;
 using DFASet =
     std::unordered_map<Instruction *, std::unordered_set<Instruction *>>;
+
+std::unordered_map<Function *, CAT_API> CATMap;
 
 class CATVisitor : public InstVisitor<CATVisitor> {
 public:
@@ -83,7 +88,7 @@ void createDefTable(Function &F, CATInsts const &CATInsts, DefTable &defTable) {
 #ifdef PRINT_DEF_TABLE
   for (auto &[var, defs] : defTable) {
     for (auto &def : defs) {
-      errs() << F.getName() << *var << *def << "\n";
+      errs() << F->getName() << *var << *def << "\n";
     }
   }
 #endif
@@ -221,7 +226,6 @@ void createReachingDefs(Function &F, CATInsts const &CATInsts,
     if (vec.empty()) {
       continue;
     }
-
     auto front = vec[0];
     in[front] = inB[&b];
     out[front] = gen[front];
@@ -231,7 +235,7 @@ void createReachingDefs(Function &F, CATInsts const &CATInsts,
       }
     }
 
-    for (unsigned long i = 1; i < vec.size() - 1; i++) {
+    for (int i = 0; i < (int)vec.size() - 1; i++) {
       auto t = vec[i], tNext = vec[i + 1];
       in[tNext] = out[t];
       out[tNext] = gen[tNext];
@@ -245,22 +249,30 @@ void createReachingDefs(Function &F, CATInsts const &CATInsts,
 #else
   for (auto &b : F) {
     auto front = &b.front();
-    in[front] = inB[&b];
-    out[front] = gen[front];
-    for (auto inst : in[front]) {
-      if (!kill[front].contains(inst)) {
-        out[front].insert(inst);
+    auto &inFront = in[front];
+    auto &outFront = out[front];
+    auto &genFront = gen[front];
+    auto &killFront = kill[front];
+    inFront = inB[&b];
+    outFront = genFront;
+    for (auto inst : inFront) {
+      if (!killFront.contains(inst)) {
+        outFront.insert(inst);
       }
     }
 
     auto t = front;
     while (t != &b.back()) {
       auto tNext = t->getNextNode();
-      in[tNext] = out[t];
-      out[tNext] = gen[tNext];
-      for (auto inst : in[tNext]) {
-        if (!kill[tNext].contains(inst)) {
-          out[tNext].insert(inst);
+      auto &inNext = in[tNext];
+      auto &outNext = out[tNext];
+      auto &genNext = gen[tNext];
+      auto &killNext = kill[tNext];
+      inNext = out[t];
+      outNext = genNext;
+      for (auto inst : inNext) {
+        if (!killNext.contains(inst)) {
+          outNext.insert(inst);
         }
       }
       t = tNext;
@@ -283,6 +295,217 @@ void createReachingDefs(Function &F, CATInsts const &CATInsts,
     }
   }
 #endif
+}
+
+bool hasCycle(Instruction *val) {
+  std::vector<Value *> stack = {val};
+  std::set<Value *> visited;
+  while (!stack.empty()) {
+    auto inst = stack.back();
+    stack.pop_back();
+    if (visited.contains(inst)) {
+      return true;
+    }
+    visited.insert(inst);
+    if (auto phi = dyn_cast<PHINode>(inst)) {
+      for (unsigned int i = 0; i < phi->getNumIncomingValues(); i++) {
+        stack.push_back(phi->getIncomingValue(i));
+      }
+    }
+  }
+  return false;
+}
+
+ConstantInt *getConstant(Value *val, CallInst *inst, DFASet const &in) {
+  ConstantInt *ci = nullptr;
+
+  if (auto phi = dyn_cast<PHINode>(val)) {
+    if (hasCycle(phi)) {
+      return nullptr;
+    }
+    for (unsigned int i = 0; i < phi->getNumIncomingValues(); i++) {
+      auto inc = phi->getIncomingValue(i);
+      if (isa<UndefValue>(inc)) {
+        continue;
+      }
+      if (auto c = getConstant(inc, inst, in)) {
+        if (!ci || c->getSExtValue() != ci->getSExtValue()) {
+          ci = c;
+          continue;
+        }
+      }
+      return nullptr;
+    }
+  }
+
+  for (auto i : in.at(inst)) {
+    if (auto call = dyn_cast<CallInst>(i)) {
+      auto callee = call->getCalledFunction();
+      if (CATMap.contains(callee)) {
+        switch (CATMap.at(callee)) {
+        case CAT_API::CAT_new:
+          if (call != val) {
+            continue;
+          }
+          break;
+        case CAT_API::CAT_add:
+        case CAT_API::CAT_sub:
+          if (call->getArgOperand(0) == val) {
+            return nullptr;
+          }
+          continue;
+        case CAT_API::CAT_set:
+          if (call->getArgOperand(0) != val) {
+            continue;
+          }
+          break;
+        default:
+          continue;
+        }
+
+        auto arg = CATMap.at(callee) == CAT_API::CAT_new
+                       ? call->getArgOperand(0)
+                       : call->getArgOperand(1);
+        if (auto c = dyn_cast<ConstantInt>(arg)) {
+          if (!ci || c->getSExtValue() == ci->getSExtValue()) {
+            ci = c;
+            continue;
+          }
+          return nullptr;
+        }
+        return nullptr;
+      }
+    }
+  }
+
+  return ci;
+}
+
+bool doConstantPropagation(Function &F, DFASet const &in) {
+  bool modified = false;
+  std::vector<std::tuple<CallInst *, ConstantInt *>> toReplace;
+
+  for (auto &inst : instructions(F)) {
+    if (auto call = dyn_cast<CallInst>(&inst)) {
+      auto it = CATMap.find(call->getCalledFunction());
+      if (it != CATMap.end() && it->second == CAT_API::CAT_get) {
+        auto arg = call->getArgOperand(0);
+        if (auto constant = getConstant(arg, call, in)) {
+          toReplace.push_back({call, constant});
+          modified = true;
+        }
+      }
+    }
+  }
+
+  for (auto &[inst, constant] : toReplace) {
+    auto parent = inst->getParent();
+    BasicBlock::iterator ii(inst);
+    ReplaceInstWithValue(parent->getInstList(), ii, constant);
+  }
+
+  return modified;
+}
+
+bool doConstantFolding(Function &F, DFASet const &in) {
+  bool modified = false;
+  std::vector<CallInst *> toDelete;
+
+  for (auto &inst : instructions(F)) {
+    if (auto call = dyn_cast<CallInst>(&inst)) {
+      auto it = CATMap.find(call->getCalledFunction());
+      if (it != CATMap.end() &&
+          (it->second == CAT_API::CAT_add || it->second == CAT_API::CAT_sub)) {
+        auto lhs = getConstant(call->getArgOperand(1), call, in),
+             rhs = getConstant(call->getArgOperand(2), call, in);
+
+        if (!lhs || !rhs) {
+          continue;
+        }
+
+        auto leftConst = lhs->getSExtValue(), rightConst = rhs->getSExtValue();
+
+        IRBuilder<> builder(call);
+        auto M = F.getParent();
+        auto setFunc = M->getFunction("CAT_set");
+        auto intType = IntegerType::get(M->getContext(), 64);
+        auto constant = it->second == CAT_API::CAT_add ? leftConst + rightConst
+                                                       : leftConst - rightConst;
+        auto constInt = ConstantInt::get(intType, constant, true);
+
+        auto setInst =
+            builder.CreateCall(setFunc, {call->getArgOperand(0), constInt});
+        call->replaceAllUsesWith(setInst);
+        toDelete.push_back(call);
+        modified = true;
+      }
+    }
+  }
+
+  for (auto inst : toDelete) {
+    inst->eraseFromParent();
+  }
+
+  return modified;
+}
+
+bool doAlgebraicSimplification(Function &F, DFASet const &in) {
+  bool modified = false;
+  std::vector<CallInst *> toDelete;
+
+  for (auto &inst : instructions(F)) {
+    if (auto call = dyn_cast<CallInst>(&inst)) {
+      IRBuilder<> builder(call);
+      auto M = F.getParent();
+      auto getFunc = M->getFunction("CAT_get");
+      auto setFunc = M->getFunction("CAT_set");
+      auto it = CATMap.find(call->getCalledFunction());
+
+      if (it == CATMap.end()) {
+        continue;
+      }
+
+      if (it->second == CAT_API::CAT_add) {
+        auto lhs = getConstant(call->getArgOperand(1), call, in),
+             rhs = getConstant(call->getArgOperand(2), call, in);
+
+        if (lhs && lhs->getSExtValue() == 0) {
+          auto getInst = builder.CreateCall(getFunc, {call->getArgOperand(2)});
+          auto setInst =
+              builder.CreateCall(setFunc, {call->getArgOperand(0), getInst});
+          call->replaceAllUsesWith(setInst);
+          toDelete.push_back(call);
+          modified = true;
+
+        } else if (rhs && rhs->getSExtValue() == 0) {
+          auto getInst = builder.CreateCall(getFunc, {call->getArgOperand(1)});
+          auto setInst =
+              builder.CreateCall(setFunc, {call->getArgOperand(0), getInst});
+          call->replaceAllUsesWith(setInst);
+          toDelete.push_back(call);
+          modified = true;
+        }
+
+      } else if (it->second == CAT_API::CAT_sub) {
+        auto rhs = getConstant(call->getArgOperand(2), call, in);
+
+        if (rhs && rhs->getSExtValue() == 0) {
+          auto getInst = builder.CreateCall(getFunc, {call->getArgOperand(1)});
+          auto setInst =
+              builder.CreateCall(setFunc, {call->getArgOperand(0), getInst});
+          call->replaceAllUsesWith(setInst);
+          toDelete.push_back(call);
+          modified = true;
+        }
+      }
+    }
+  }
+
+  for (auto inst : toDelete) {
+    inst->eraseFromParent();
+  }
+
+  return modified;
 }
 
 struct CAT : public FunctionPass {
@@ -315,7 +538,12 @@ struct CAT : public FunctionPass {
     DFASet in, out;
     createReachingDefs(F, CATInsts, defTable, in, out);
 
-    return false;
+    bool modified = false;
+    modified |= doConstantPropagation(F, in);
+    modified |= doConstantFolding(F, in);
+    modified |= doAlgebraicSimplification(F, in);
+
+    return modified;
   }
 
   // We don't modify the program, so we preserve all analyses.
